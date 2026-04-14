@@ -1,115 +1,249 @@
 #!/bin/bash
 echo "Будет установлен Vless с транспортом TCP"
-sleep 3
-apt update
-apt install qrencode curl jq -y
 
-# Включаем bbr
-bbr=$(sysctl -a | grep net.ipv4.tcp_congestion_control)
-if [ "$bbr" = "net.ipv4.tcp_congestion_control = bbr" ]; then
-echo "bbr уже включен"
-else
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-sysctl -p
-echo "bbr включен"
-fi
+ensure_deps() {
+    local pkgs=()
+    command -v curl     &>/dev/null || pkgs+=(curl)
+    command -v jq       &>/dev/null || pkgs+=(jq)
+    command -v qrencode &>/dev/null || pkgs+=(qrencode)
+    command -v openssl  &>/dev/null || pkgs+=(openssl)
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        info "Installing dependencies: ${pkgs[*]}"
+        apt-get update -qq
+        apt-get install -y -qq "${pkgs[@]}"
+    fi
+}
 
-# Устанавливаем ядро Xray
-bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-[ -f /usr/local/etc/xray/.keys ] && rm /usr/local/etc/xray/.keys
-touch /usr/local/etc/xray/.keys
-echo "shortsid: $(openssl rand -hex 8)" >> /usr/local/etc/xray/.keys
-echo "uuid: $(xray uuid)" >> /usr/local/etc/xray/.keys
-xray x25519 >> /usr/local/etc/xray/.keys
+xray_installed_version() {
+    /usr/local/bin/xray version 2>/dev/null | awk 'NR==1{print $2}' || echo "none"
+}
 
-export uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
-export privatkey=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/PrivateKey/ {print $2}')
-export shortsid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
+xray_latest_version() {
+    curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
+        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/'
+}
 
-# Создаем файл конфигурации Xray
-touch /usr/local/etc/xray/config.json
-cat << EOF > /usr/local/etc/xray/config.json
+install_xray() {
+    ensure_deps
+    local ver
+    ver=$(xray_latest_version)
+    [[ -z "$ver" ]] && die "Could not fetch latest Xray version from GitHub"
+    local current
+    current=$(xray_installed_version)
+    if [[ "$current" == "$ver" ]]; then
+        ok "Xray is already up to date (v${ver})"
+    else
+        info "Installing Xray v${ver} (was: ${current})"
+        local arch
+        arch=$(uname -m)
+        case "$arch" in
+            x86_64)  arch_str="64" ;;
+            aarch64) arch_str="arm64-v8a" ;;
+            armv7*)  arch_str="arm32-v7a" ;;
+            *)       die "Unsupported architecture: $arch" ;;
+        esac
+        WORK_DIR=$(mktemp -d)
+        local url="https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-${arch_str}.zip"
+        info "Downloading from: $url"
+        curl -fsSL "$url" -o "$WORK_DIR/xray.zip"
+        apt-get install -y -qq unzip &>/dev/null
+        unzip -q "$WORK_DIR/xray.zip" -d "$WORK_DIR/xray"
+        install -m 755 "$WORK_DIR/xray/xray" /usr/local/bin/xray
+        ok "Xray v${ver} installed"
+    fi
+    update_geo
+    setup_systemd
+}
+
+sysctl_tune() {
+    local params=(
+        "net.core.default_qdisc=fq"
+        "net.ipv4.tcp_congestion_control=bbr"
+    )
+    for param in "${params[@]}"; do
+        local key="${param%%=*}"
+        local value="${param#*=}"
+        if sysctl -n "$key" 2>/dev/null | grep -q "$value"; then
+            ok "$key is already set to $value"
+        else
+            echo "$param" >> /etc/sysctl.conf
+            sysctl -w "$param" &>/dev/null
+            ok "Set $key to $value"
+        fi
+    done
+}
+
+update_geo() {
+    local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geoip.dat"
+    local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geosite.dat"
+    
+    info "Updating geo files..."
+    mkdir -p "$GEO_DIR"
+
+    local tmp_ip tmp_site
+    tmp_ip=$(mktemp)
+    tmp_site=$(mktemp)
+
+    if curl -fsSL --progress-bar "$geoip_url" -o "$tmp_ip"; then
+        mv "$tmp_ip" "${GEO_DIR}/geoip.dat"
+        chmod 644 "${GEO_DIR}/geoip.dat"
+        ok "geoip.dat updated ($(du -sh "${GEO_DIR}/geoip.dat" | cut -f1))"
+    else
+        rm -f "$tmp_ip"
+        warn "Failed to download geoip.dat — keeping existing file"
+    fi
+
+    if curl -fsSL --progress-bar "$geosite_url" -o "$tmp_site"; then
+        mv "$tmp_site" "${GEO_DIR}/geosite.dat"
+        chmod 644 "${GEO_DIR}/geosite.dat"
+        ok "geosite.dat updated ($(du -sh "${GEO_DIR}/geosite.dat" | cut -f1))"
+    else
+        rm -f "$tmp_site"
+        warn "Failed to download geosite.dat — keeping existing file"
+    fi
+}
+
+setup_systemd() {
+    if [[ ! -f /etc/systemd/system/xray.service ]]; then
+        info "Creating systemd service..."
+        cat > /etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable xray &>/dev/null
+        ok "Systemd service created and enabled"
+    fi
+    ensure_base_config
+    systemctl restart xray && ok "Xray service started" || warn "Service start failed — check: journalctl -u xray -n 30"
+}
+
+ensure_base_config() {
+    mkdir -p "$(dirname "$XRAY_CONFIG")"
+    if [[ ! -f "$XRAY_CONFIG" ]]; then
+        warn "No config found — generating fresh config with TCP+REALITY on 443"
+
+        # Verify xray binary is usable before calling it
+        [[ -x /usr/local/bin/xray ]] || die "xray binary not found at /usr/local/bin/xray"
+
+        # Generate all dynamic values BEFORE the heredoc — no subshells inside heredoc
+        local kp_tcp
+        kp_tcp=$(/usr/local/bin/xray x25519 2>&1)
+
+        local privkey_tcp pubkey_tcp
+        privkey_tcp=$(echo   "$kp_tcp"   | awk '/PrivateKey:|Private key/{print $NF}')
+        pubkey_tcp=$(echo    "$kp_tcp"   | awk '/PublicKey\):|^PublicKey:|Public key/{print $NF}')
+
+        [[ -n "$privkey_tcp"   ]] || die "Failed to generate TCP key pair (xray x25519 returned: $kp_tcp)"
+        [[ -n "$pubkey_tcp"    ]] || die "Failed to parse TCP public key"
+
+        local shortid_tcp
+        shortid_tcp=$(openssl rand -hex 8)
+
+        local main_uuid=$(/usr/local/bin/xray uuid)
+
+        local ip=$(curl api.ipify.org -4 -s)
+
+        cat > "$XRAY_CONFIG" <<EOF
 {
-    "log": {
-        "loglevel": "warning"
-    },
-    "routing": {
-        "domainStrategy": "IPIfNonMatch",
-        "rules": [
+  "_comment_tcp_pubkey": "${pubkey_tcp}",
+  "_comment_tcp_shortid": "${shortid_tcp}",
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "_tag": "tcp-reality",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
             {
-                "type": "field",
-                "domain": [
-                    "geosite:category-ads-all"
-                ],
-                "outboundTag": "block"
+                "email": "main",
+                "id": "${main_uuid}",
+                "flow": "xtls-rprx-vision"
             }
-        ]
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": ["www.microsoft.com"],
+          "privateKey": "${privkey_tcp}",
+          "shortIds": ["${shortid_tcp}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
     },
-    "inbounds": [
-        {
-            "listen": "0.0.0.0",
-            "port": 443,
-            "protocol": "vless",
-            "settings": {
-                "clients": [
-                    {
-                        "email": "main",
-                        "id": "$uuid",
-                        "flow": "xtls-rprx-vision"
-                    }
-                ],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "reality",
-                "realitySettings": {
-                    "show": false,
-                    "dest": "github.com:443",
-                    "xver": 0,
-                    "serverNames": [
-                        "github.com",
-                        "www.github.com"
-                    ],
-                    "privateKey": "$privatkey",
-                    "minClientVer": "",
-                    "maxClientVer": "",
-                    "maxTimeDiff": 0,
-                    "shortIds": [
-                        "$shortsid"
-                    ]
-                }
-            },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": [
-                    "http",
-                    "tls"
-                ]
-            }
-        }
-    ],
-    "outbounds": [
-        {
-            "protocol": "freedom",
-            "tag": "direct"
-        },
-        {
-            "protocol": "blackhole",
-            "tag": "block"
-        }
-    ],
-    "policy": {
-        "levels": {
-            "0": {
-                "handshake": 3,
-                "connIdle": 180
-            }
-        }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
     }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "domain": ["geosite:category-ads-all"],
+        "outboundTag": "block"
+      }
+    ]
+  }
 }
 EOF
+        # Verify the written config is valid JSON before proceeding
+        jq empty "$XRAY_CONFIG" || die "Config file is not valid JSON — check $XRAY_CONFIG"
+
+        ok "Config written to $XRAY_CONFIG"
+        echo ""
+        echo -e "  ${BOLD}TCP  REALITY public key :${RESET} ${pubkey_tcp}"
+        echo -e "  ${BOLD}TCP  short ID           :${RESET} ${shortid_tcp}"
+        echo ""
+        echo -e "vless://$main_uuid@${ip}:443?security=reality&sni=www.microsoft.com&fp=randomized&pbk=${pubkey_tcp}&sid=${shortid_tcp}&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#vless_${ip}"
+    fi
+}
+
+sysctl_tune
+update_geo
+install_xray
+setup_systemd
 
 # Исполняемый файл для списка клиентов
 touch /usr/local/bin/userlist
@@ -139,8 +273,8 @@ uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
 pbk=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/Password/ {print $2}')
 sid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/shortsid/ {print $2}')
 sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(timeout 3 curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#vless-$ip"
+ip=$(curl api.ipify.org -4 -s)
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=randomized&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#vless-$ip"
 echo ""
 echo "Ссылка для подключения":
 echo "$link"
