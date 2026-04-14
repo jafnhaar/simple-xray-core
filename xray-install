@@ -280,61 +280,57 @@ done
 EOF
 chmod +x /usr/local/bin/userlist
 
-# исполняемый файл для ссылки основного пользователя
-touch /usr/local/bin/mainuser
-cat << 'EOF' > /usr/local/bin/mainuser
-#!/bin/bash
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
-pbk=$(jq -r '._comment_tcp_pubkey' /usr/local/etc/xray/config.json)
-sid=$(jq -r '._comment_tcp_shortid' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(curl api.ipify.org -4 -s)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=randomized&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#vless-$ip"
-echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
-EOF
-chmod +x /usr/local/bin/mainuser
-
 # Исполняемый файл для создания новых клиентов
 touch /usr/local/bin/newuser
 cat << 'EOF' > /usr/local/bin/newuser
 #!/bin/bash
-read -p "Введите имя пользователя (email): " email
 
-    if [[ -z "$email" || "$email" == *" "* ]]; then
-    echo "Имя пользователя не может быть пустым или содержать пробелы. Попробуйте снова."
+email="$1"
+
+if [[ -z "$email" ]]; then
+    echo "Ошибка: Необходимо указать имя пользователя (email) как аргумент."
+    echo "Использование: $0 user@example.com"
     exit 1
-    fi
+fi
+
+if [[ "$email" == *" "* ]]; then
+    echo "Ошибка: Имя пользователя не может содержать пробелы."
+    exit 1
+fi
+
+# Search for existing user
 user_json=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
 
 if [[ -z "$user_json" ]]; then
-uuid=$(xray uuid)
-jq --arg email "$email" --arg uuid "$uuid" '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
-systemctl restart xray
-index=$(jq --arg email "$email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-pbk=$(jq -r '._comment_tcp_pubkey' /usr/local/etc/xray/config.json)
-sid=$(jq -r '._comment_tcp_shortid' /usr/local/etc/xray/config.json)
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
-ip=$(curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
-echo ""
-echo "Ссылка для подключения":
-echo "$link"
-echo ""
-echo "QR-код:"
-echo ${link} | qrencode -t ansiutf8
+    # Generate UUID and update config
+    uuid=$(xray uuid)
+    jq --arg email "$email" --arg uuid "$uuid" '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
+    
+    # Restart service
+    systemctl restart xray
+
+    # Extract connection data
+    index=$(jq --arg email "$email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
+    protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
+    port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
+    uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
+    pbk=$(jq -r '._comment_tcp_pubkey' /usr/local/etc/xray/config.json)
+    sid=$(jq -r '._comment_tcp_shortid' /usr/local/etc/xray/config.json)
+    username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
+    sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
+    ip=$(curl -4 -s icanhazip.com)
+
+    # Generate link
+    link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=randomized&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
+
+    echo ""
+    echo "Ссылка для подключения:"
+    echo "$link"
+    echo ""
+    echo "QR-код:"
+    echo "${link}" | qrencode -t ansiutf8
 else
-echo "Пользователь с таким именем уже существует. Попробуйте снова." 
+    echo "Пользователь с таким именем уже существует. Попробуйте снова." 
 fi
 EOF
 chmod +x /usr/local/bin/newuser
@@ -403,7 +399,7 @@ sid=$(jq -r '._comment_tcp_shortid' /usr/local/etc/xray/config.json)
 username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
 sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
 ip=$(curl -4 -s icanhazip.com)
-link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
+link="$protocol://$uuid@$ip:$port?security=reality&sni=$sni&fp=randomized&pbk=$pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$username"
 echo ""
 echo "Ссылка для подключения":
 echo "$link"
