@@ -216,7 +216,7 @@ ensure_base_config() {
         "enabled": true,
         "destOverride": ["http", "tls", "quic"]
       }
-    },
+    }
   ],
   "outbounds": [
     {
@@ -412,8 +412,6 @@ echo "QR-код:"
 echo ${link} | qrencode -t ansiutf8
 EOF
 chmod +x /usr/local/bin/sharelink
-
-systemctl restart xray
 
 info "Xray-core успешно установлен"
 
