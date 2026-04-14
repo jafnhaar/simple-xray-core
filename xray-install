@@ -86,6 +86,7 @@ sysctl_tune() {
 update_geo() {
     local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geoip.dat"
     local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geosite.dat"
+    local GEO_DIR="/usr/local/share/xray"
     
     info "Updating geo files..."
     mkdir -p "$GEO_DIR"
