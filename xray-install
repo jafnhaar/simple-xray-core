@@ -9,6 +9,11 @@ warn() { echo -e "${YELLOW}⚠${RESET}  $*"; }
 die()  { echo -e "${RED}✘${RESET}  $*" >&2; exit 1; }
 sep()  { echo -e "${BLUE}──────────────────────────────────────────────${RESET}"; }
 
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_SERVICE="xray"
+SCRIPT_PATH="$(realpath "$0")"
+CRON_TAG="# xray-manage auto-update"
+
 info "Будет установлен Vless с транспортом TCP"
 
 ensure_deps() {
@@ -87,7 +92,7 @@ update_geo() {
     local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geoip.dat"
     local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geosite.dat"
     local GEO_DIR="/usr/local/share/xray"
-    
+
     info "Updating geo files..."
     mkdir -p "$GEO_DIR"
 
